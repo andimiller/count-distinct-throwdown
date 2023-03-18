@@ -1,47 +1,100 @@
-import cats.Monoid
+import cats.effect.std.Random
+import cats.effect.{ExitCode, IO, IOApp, Sync}
+import cats.implicits._
+import cats.{Eval, Monad}
 import com.clearspring.analytics.stream.cardinality.HyperLogLog
 import com.dynatrace.hash4j.distinctcount.UltraLogLog
+import org.atnos.origami.Fold
+import fs2._
+import org.apache.datasketches.theta.{Sketch, Sketches, UpdateSketch}
 
 import scala.collection.mutable
 
-trait DistinctCount[T] extends Monoid[T] {
-  def add(t: T, hash: Long): T
-  def estimate(t: T): Double
-}
-
 object DistinctCount {
-  def apply[T](implicit dc: DistinctCount[T]): DistinctCount[T] = dc
 
-  implicit val distinctCountLongSet: DistinctCount[mutable.Set[Long]] = new DistinctCount[mutable.Set[Long]] {
-    override def add(t: mutable.Set[Long], hash: Long): mutable.Set[Long] = t.addOne(hash)
-    override def empty: mutable.Set[Long] = mutable.Set.empty
-    override def combine(x: mutable.Set[Long], y: mutable.Set[Long]): mutable.Set[Long] = x ++ y
-    override def estimate(t: mutable.Set[Long]): Double = t.size.toDouble
-  }
+  def set = new Fold[IO, Long, (Long, AnyRef)] {
+    type S = mutable.Set[Long]
 
-  case class ClearspringConfig(rsd: Int)
-  implicit def clearspring(implicit cc: ClearspringConfig): DistinctCount[HyperLogLog] = new DistinctCount[HyperLogLog] {
-    override def add(t: HyperLogLog, hash: Long): HyperLogLog = {
-      t.offerHashed(hash)
-      t
+    override def monad: Monad[IO] = implicitly
+
+    override def start: IO[mutable.Set[Long]] = IO.pure(mutable.Set.empty[Long])
+    override def fold: (mutable.Set[Long], Long) => IO[mutable.Set[Long]] = { (s, l) =>
+      IO {
+        s.addOne(l)
+      }
     }
-    override def estimate(t: HyperLogLog): Double = t.cardinality().toDouble
-    override def empty: HyperLogLog = new HyperLogLog(cc.rsd)
-    override def combine(x: HyperLogLog, y: HyperLogLog): HyperLogLog = {
-      x.addAll(y)
-      x
+    override def end(s: mutable.Set[Long]): IO[(Long, AnyRef)] = IO {
+      (s.size.toLong, s)
     }
   }
 
-  // p is 3 to 26
-  case class UltraLogLogConfig(p: Int)
-  implicit def ultraloglog(implicit ullc: UltraLogLogConfig): DistinctCount[UltraLogLog] = new DistinctCount[UltraLogLog] {
-    override def add(t: UltraLogLog, hash: Long): UltraLogLog = t.add(hash)
-    override def estimate(t: UltraLogLog): Double = t.getDistinctCountEstimate
-    override def empty: UltraLogLog = UltraLogLog.create(ullc.p)
-    override def combine(x: UltraLogLog, y: UltraLogLog): UltraLogLog = {
-      x.add(y)
-      x
+  def clearspring(rsd: Int) = new Fold[IO, Long, (Long, AnyRef)] {
+
+    type S = HyperLogLog
+
+    override def monad: Monad[IO] = implicitly
+
+    override def start: IO[HyperLogLog] = IO {
+      new HyperLogLog(rsd)
+    }
+
+    override def fold: (HyperLogLog, Long) => IO[HyperLogLog] = { case (hll, long) =>
+      IO {
+        hll.offerHashed(long)
+        hll
+      }
+    }
+
+    override def end(s: HyperLogLog): IO[(Long, AnyRef)] = IO {
+      (s.cardinality(), s)
     }
   }
+
+  def ull(p: Int) = new Fold[IO, Long, (Long, AnyRef)] {
+    type S = UltraLogLog
+
+    override def monad: Monad[IO] = implicitly
+
+    override def start: IO[UltraLogLog] = IO {
+      UltraLogLog.create(p)
+    }
+
+    override def fold: (UltraLogLog, Long) => IO[UltraLogLog] = { case (ull, long) =>
+      IO {
+        ull.add(long)
+        ull
+      }
+    }
+
+    override def end(s: UltraLogLog): IO[(Long, AnyRef)] = IO {
+      (s.getDistinctCountEstimate.toLong, s)
+    }
+  }
+
+  def theta(lgK: Int) = new Fold[IO, Long, (Long, AnyRef)] {
+    override def monad: Monad[IO] = implicitly
+
+    override type S = UpdateSketch
+
+    override def start: IO[UpdateSketch] = IO {
+      UpdateSketch.builder().setLogNominalEntries(lgK).build()
+    }
+
+    override def fold: (UpdateSketch, Long) => IO[UpdateSketch] = { case (s, l) =>
+      IO {
+        s.update(l)
+        s
+      }
+    }
+
+    override def end(s: UpdateSketch): IO[(Long, AnyRef)] = IO {
+      (
+        s.getEstimate.toLong,
+        s.compact()
+      )
+    }
+  }
+
+
+
 }
